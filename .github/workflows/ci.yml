@@ -15,10 +15,95 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  detect:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.filter.outputs.matrix }}
+      has_changes: ${{ steps.filter.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: filter
+        run: |
+          ALL=$(find services -mindepth 2 -maxdepth 2 -name pom.xml -exec dirname {} \; | sed 's|^services/||' | sort)
+
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            SELECTED="$ALL"
+          else
+            BASE="${{ github.event.pull_request.base.sha }}"
+            git cat-file -e "${BASE}^{commit}" 2>/dev/null || git fetch --no-tags origin "$BASE"
+            CHANGED=$(git -c core.quotepath=false diff --name-only --no-renames "${BASE}...HEAD")
+            if grep -Eq '^(\.github/workflows/|config/checkstyle/|docker/Dockerfile\.template$)' <<< "$CHANGED"; then
+              SELECTED="$ALL"
+            else
+              SELECTED=$(awk -F/ '$1=="services" && NF>=3 {print $2}' <<< "$CHANGED" | sort -u | while read -r s; do
+                if [[ -f "services/$s/pom.xml" ]]; then
+                  echo "$s"
+                fi
+              done)
+            fi
+          fi
+
+          if [[ -n "$SELECTED" ]]; then
+            MATRIX=$(printf '%s\n' "$SELECTED" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            HAS_CHANGES=true
+          else
+            MATRIX='[]'
+            HAS_CHANGES=false
+          fi
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "has_changes=$HAS_CHANGES" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build & Lint (${{ matrix.service }})
+    needs: detect
+    if: needs.detect.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.detect.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: services/${{ matrix.service }}/pom.xml
+
+      - name: Build & Unit Test
+        run: |
+          chmod +x mvnw
+          ./mvnw -B verify
+
+      - name: Lint (Checkstyle)
+        run: |
+          ./mvnw -B org.apache.maven.plugins:maven-checkstyle-plugin:3.6.0:check \
+            "-Dcheckstyle.config.location=${{ github.workspace }}/config/checkstyle/checkstyle.xml" \
+            -Dcheckstyle.includeTestSourceDirectory=true \
+            -Dcheckstyle.consoleOutput=true \
+            -Dcheckstyle.failOnViolation=true
+
   ci-gate:
     name: CI-Pass
+    needs: [detect, build]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Pass placeholder CI gate
-        run: echo "CI gate passed."
+      - name: Evaluate CI status
+        run: |
+          if [[ "${{ needs.detect.result }}" != "success" ]]; then
+            exit 1
+          fi
+          if [[ "${{ needs.build.result }}" != "success" && "${{ needs.build.result }}" != "skipped" ]]; then
+            exit 1
+          fi
